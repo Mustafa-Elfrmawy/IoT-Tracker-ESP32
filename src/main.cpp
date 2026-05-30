@@ -103,6 +103,7 @@ bool checkGpsNeoStatus()
   return true;
 }
 
+// for test 
 bool waitForNetwork()
 {
   Serial.println("\n-> Waiting for Network Registration...");
