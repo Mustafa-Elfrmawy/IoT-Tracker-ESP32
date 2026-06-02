@@ -1,5 +1,5 @@
-// {version 1.0.1} - Mapped with Mutex Protection & Safe Parsing 
-// Mostafa ElFaramawy 
+// {version 1.0.2} - Mapped with Mutex Protection, Safe Parsing & Hot Start Fixed
+// Mostafa ElFaramawy
 #include <Arduino.h>
 #include <TinyGPS++.h>
 #include "driver/gpio.h"
@@ -13,7 +13,6 @@ SemaphoreHandle_t gpsMutex;
 RTC_DATA_ATTR bool isMachineKilled = false;
 
 bool gps_is_alive = false;
-
 
 #define GPS_RX_PIN 19
 #define GPS_TX_PIN 18
@@ -34,23 +33,32 @@ void initSerial2AndGPS()
 
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+
+  Serial.println("-> Forcing GPS Hardware Wake-up...");
+  pinMode(GPS_TX_PIN, OUTPUT);
+  digitalWrite(GPS_TX_PIN, LOW);
+  delay(50);
+  digitalWrite(GPS_TX_PIN, HIGH);
+  delay(100);
+
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   pinMode(SIM800C_DTR_PIN, OUTPUT);
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(IGNITION_PIN, INPUT_PULLUP);
-  if (isMachineKilled) {
-    digitalWrite(RELAY_PIN, LOW); 
-  } else {
+
+  if (isMachineKilled)
+  {
+    digitalWrite(RELAY_PIN, LOW);
+  }
+  else
+  {
     digitalWrite(RELAY_PIN, HIGH);
   }
 
   digitalWrite(SIM800C_DTR_PIN, LOW);
   Serial2.println("AT+CSCLK=0");
-  byte coldStart[] = {0xB5, 0x62, 0x06, 0x04, 0x04, 0x00, 0xFF, 0x87, 0x02, 0x00, 0x90, 0x6F};
-  Serial.println("-> Sending Cold Start to GPS...");
-  gpsSerial.write(coldStart, sizeof(coldStart));
-  delay(2000); 
+
   delay(1000);
 }
 
@@ -77,7 +85,7 @@ bool checkGpsNeoStatus()
   unsigned long start = millis();
   uint32_t initialChars = gps.charsProcessed();
 
-  while (millis() - start < 3000)
+  while (millis() - start < 5000)
   {
     while (gpsSerial.available() > 0)
     {
@@ -93,17 +101,18 @@ bool checkGpsNeoStatus()
         }
       }
     }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 
   if (gps.charsProcessed() - initialChars < 10)
   {
-    Serial.println("-> [CRITICAL ERROR] No data received from GPS.");
+    Serial.println("-> [WARNING] No data received from GPS. Module might be asleep or disconnected.");
     return false;
   }
+  Serial.println("-> [INFO] GPS is communicating, but no valid fix encoded yet.");
   return true;
 }
 
-// for test 
 bool waitForNetwork()
 {
   Serial.println("\n-> Waiting for Network Registration...");
@@ -155,13 +164,13 @@ bool JsonParsing(String response)
     isMachineKilled = false;
     digitalWrite(RELAY_PIN, HIGH);
   }
-  
+
   return true;
 }
 
 void sleepAllDevices()
 {
-  Serial.println("\n>>> TEST COMPLETE: Confirmed condition. Going to DEEP SLEEP! <<<");
+  Serial.println("\n>>> Condition Confirmed. Going to DEEP SLEEP! <<<");
 
   Serial2.println("AT+CSCLK=1");
   delay(200);
@@ -173,7 +182,7 @@ void sleepAllDevices()
   gpio_hold_en((gpio_num_t)RELAY_PIN);
   gpio_deep_sleep_hold_en();
 
-  Serial.println(">>> GOING TO DEEP SLEEP (Wakes up in 30 mins OR if ACC condition changes) <<<");
+  Serial.println(">>> GOING TO DEEP SLEEP (Wakes up in 30 mins OR if ACC changes) <<<");
   Serial.flush();
 
   esp_sleep_enable_timer_wakeup(30ULL * 60ULL * 1000000ULL);
@@ -202,9 +211,8 @@ bool isContacClosed()
     }
     return isReallyON;
   }
-    Serial.println("\n[Test Logic] ACC is On. Continuing normal tracking...");
-    return false;
-  
+  Serial.println("\n[Test Logic] ACC is On. Continuing normal tracking...");
+  return false;
 }
 
 void sendToServerTask(void *pvParameters)
@@ -221,9 +229,11 @@ void sendToServerTask(void *pvParameters)
     }
 
     String signalStrength = SimService::getSignalStrengthText();
-    
-    String url = "http://[YOURDEVICE-OR-YOURSERVER-IP]/api/test?lat=" + String(myLocation.lat, 6) +
-                 "&gia=" + String(gps_is_alive) + //
+
+    // gps-traker.myacademy.tech
+    // http://161.97.84.206:8070/
+    String url = "http://161.97.84.206:8070/api/tracker-to-server?lat=" + String(myLocation.lat, 6) +
+                 "&gia=" + String(gps_is_alive) +
                  "&giv=" + String(myLocation.isValid) +
                  "&lng=" + String(myLocation.lng, 6) +
                  "&alt=" + String(myLocation.alt, 1) +
@@ -271,7 +281,7 @@ void setup()
       NULL,
       1,
       &ServerTask,
-      0); 
+      0);
 }
 
 void loop()
@@ -285,4 +295,52 @@ void loop()
       xSemaphoreGive(gpsMutex);
     }
   }
+  vTaskDelay(1 / portTICK_PERIOD_MS);
 }
+
+// #include <Arduino.h>
+// #include <TinyGPS++.h>
+
+// #define GPS_RX_PIN 19
+// #define GPS_TX_PIN 18
+
+// TinyGPSPlus gps;
+// HardwareSerial gpsSerial(1);
+
+// void setup() {
+//   Serial.begin(115200);
+//   delay(2000);
+//   Serial.println("=== GPS Neo-M8N Raw Test ===");
+
+//   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+//   Serial.println("Waiting for GPS data and satellite lock...");
+// }
+
+// void loop() {
+//   while (gpsSerial.available() > 0) {
+//     char c = gpsSerial.read();
+//     gps.encode(c);
+//   }
+
+//   static unsigned long lastPrint = 0;
+//   if (millis() - lastPrint > 2000) {
+//     lastPrint = millis();
+
+//     Serial.print("Satellites in view: ");
+//     Serial.println(gps.satellites.value());
+
+//     if (gps.location.isValid()) {
+//       Serial.print("Latitude: ");
+//       Serial.println(gps.location.lat(), 6);
+//       Serial.print("Longitude: ");
+//       Serial.println(gps.location.lng(), 6);
+//       Serial.print("Speed (km/h): ");
+//       Serial.println(gps.speed.kmph());
+//       Serial.print("Altitude (meters): ");
+//       Serial.println(gps.altitude.meters());
+//     } else {
+//       Serial.println("GPS Signal: [No Fix Yet] - Searching for satellites...");
+//     }
+//     Serial.println("----------------------------------------");
+//   }
+// }
