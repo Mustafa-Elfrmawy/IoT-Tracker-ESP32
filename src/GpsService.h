@@ -45,10 +45,7 @@ public:
         return data;
     }
 
-    static void resetModule(HardwareSerial &serial)
-    {
-        serial.println("$PUBX,40,RST,0,0,1,0*1C");
-    }
+ 
 };
 
 #endif
