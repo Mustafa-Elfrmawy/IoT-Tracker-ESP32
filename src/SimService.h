@@ -6,7 +6,8 @@
 class SimService
 {
 public:
-  static String sendCommand(String cmd, int waitTime = 2000, String expectedResponse = "")
+  // Using const String& for memory optimization to avoid fragmentation
+  static String sendCommand(const String& cmd, int waitTime = 2000, const String& expectedResponse = "")
   {
     Serial2.print(cmd + "\r\n");
     unsigned long start = millis();
@@ -32,7 +33,7 @@ public:
       }
       vTaskDelay(10 / portTICK_PERIOD_MS);
     }
-    vTaskDelay(1000 / portTICK_PERIOD_MS); 
+    vTaskDelay(500 / portTICK_PERIOD_MS); 
     return response;
   }
 
@@ -105,16 +106,18 @@ public:
 
   static bool ensureGPRS()
   {
-    String checkIP = sendCommand("AT+SAPBR=2,1", 3000, "OK");
+    String checkIP = sendCommand("AT+CIFSR", 3000, "."); 
 
-    if (checkIP.indexOf("0.0.0.0") != -1 || checkIP.indexOf("ERROR") != -1)
+    if (checkIP.indexOf("ERROR") != -1 || checkIP.length() < 7)
     {
       Serial.println("\n[SimService] Reconnecting to GPRS...");
-      sendCommand("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 2000, "OK");
-      sendCommand("AT+SAPBR=3,1,\"APN\",\"mobinilweb\"", 2000, "OK");
+      sendCommand("AT+CIPSHUT", 2000, "SHUT OK");
+      sendCommand("AT+CGATT=1", 3000, "OK");
+      sendCommand("AT+CSTT=\"mobinilweb\",\"\",\"\"", 3000, "OK");
+      sendCommand("AT+CIICR", 5000, "OK");
       
-      String connectRes = sendCommand("AT+SAPBR=1,1", 15000, "OK");
-      if (connectRes.indexOf("ERROR") != -1)
+      String ip = sendCommand("AT+CIFSR", 3000, ".");
+      if (ip.indexOf("ERROR") != -1 || ip.length() < 7)
       {
         return false;
       }
@@ -122,78 +125,99 @@ public:
     return true;
   }
 
-  static void checkHttpFailures(int &counter)
+  static bool ensureUdpConnection(const String& serverIp, const String& port, bool forceReconnect = false)
   {
-    Serial.printf("\n[SimService] HTTP Failures: %d/3\n", counter);
+    static bool isUdpConnected = false;
+
+    if (!ensureGPRS()) {
+      isUdpConnected = false;
+      return false;
+    }
+
+    if (isUdpConnected && !forceReconnect) {
+      return true;
+    }
+
+    Serial.println("\n[SimService] Opening persistent UDP connection...");
+    sendCommand("AT+CIPCLOSE", 1000); // تنظيف أي اتصال معلق
+
+    String connCmd = "AT+CIPSTART=\"UDP\",\"" + serverIp + "\",\"" + port + "\"";
+    String connRes = sendCommand(connCmd, 5000, "CONNECT OK");
+
+    if (connRes.indexOf("CONNECT OK") != -1 || connRes.indexOf("ALREADY CONNECT") != -1)
+    {
+      isUdpConnected = true;
+      return true;
+    }
+    
+    isUdpConnected = false;
+    return false;
+  }
+
+  static void checkUdpFailures(int &counter)
+  {
+    Serial.printf("\n[SimService] UDP Failures: %d/8\n", counter);
     if (counter >= 8)
     {
-      Serial.println("\n[SimService] CRITICAL: HTTP Failures! Rebooting...");
+      Serial.println("\n[SimService] CRITICAL: UDP Failures! Rebooting...");
       vTaskDelay(5000 / portTICK_PERIOD_MS);
       ESP.restart();
     }
   }
 
-static String sendHttp(String url)
+  static String sendUdp(const String& serverIp, const String& port, const String& payload)
   {
-    static int httpFailCounter = 0;
+    static int udpFailCounter = 0;
     
-    if (!ensureGPRS())
+    if (!ensureUdpConnection(serverIp, port))
     {
-      httpFailCounter++;
-      checkHttpFailures(httpFailCounter);
-      return "Request Failed: No GPRS.";
+      udpFailCounter++;
+      checkUdpFailures(udpFailCounter);
+      return "Request Failed: Cannot establish UDP.";
     }
 
-    sendCommand("AT+HTTPTERM", 1000);
-    
-    if (sendCommand("AT+HTTPINIT", 3000, "OK").indexOf("ERROR") != -1)
-    {
-      sendCommand("AT+HTTPTERM", 1000);
-      httpFailCounter++;
-      checkHttpFailures(httpFailCounter);
-      return "Request Failed at HTTPINIT.";
-    }
+    String sendCmd = "AT+CIPSEND=" + String(payload.length());
+    String prompt = sendCommand(sendCmd, 2000, ">");
 
-    sendCommand("AT+HTTPPARA=\"CID\",1", 2000, "OK");
-    sendCommand("AT+HTTPPARA=\"URL\",\"" + url + "\"", 2000, "OK");
-    
-    sendCommand("AT+HTTPACTION=0", 2000, "OK");
-
-    String actionRes = "";
-    unsigned long startWait = millis();
-    while (millis() - startWait < 15000)
+    if (prompt.indexOf(">") != -1)
     {
-      while (Serial2.available())
+      Serial2.print(payload);
+      String sendRes = sendCommand("", 5000, "SEND OK"); 
+
+      if (sendRes.indexOf("SEND OK") != -1)
       {
-        char c = Serial2.read();
-        if (c >= 32 || c == '\r' || c == '\n') 
+        udpFailCounter = 0;
+        
+        String serverResult = "";
+        unsigned long startWait = millis();
+        while (millis() - startWait < 3000)
         {
-          actionRes += c;
+           while (Serial2.available())
+           {
+             char c = Serial2.read();
+             if (c >= 32 || c == '\r' || c == '\n' || c == '{' || c == '}') {
+                serverResult += c;
+             }
+             Serial.write(c);
+           }
+           if (serverResult.indexOf("}") != -1) {
+             break;
+           }
+           vTaskDelay(10 / portTICK_PERIOD_MS);
         }
-        Serial.write(c);
+        
+        return serverResult.length() > 0 ? serverResult : "UDP Data Sent.";
       }
-      if (actionRes.indexOf("+HTTPACTION:") != -1 && actionRes.indexOf("\n", actionRes.indexOf("+HTTPACTION:")) != -1)
-      {
-        break;
-      }
-      vTaskDelay(10 / portTICK_PERIOD_MS);
     }
     
-    String serverResult = "";
-    if (actionRes.indexOf("200") != -1 || actionRes.indexOf("201") != -1)
-    {
-      serverResult = sendCommand("AT+HTTPREAD", 5000, "OK");
-      httpFailCounter = 0; // تصفير عداد الفشل لأن الريكويست نجح
-    }
-    else
-    {
-      serverResult = "Request Failed.";
-      httpFailCounter++;
-      checkHttpFailures(httpFailCounter);
-    }
-
-    sendCommand("AT+HTTPTERM", 1000, "OK");
-    return serverResult;
+    Serial.println("\n[SimService] UDP Send Failed! Connection dropped. Forcing reconnect...");
+    sendCommand("AT+CIPCLOSE", 1000);
+    ensureUdpConnection(serverIp, port, true); // تحديث الحالة لـ Disconnected وطلب فتح جديد
+    
+    udpFailCounter++;
+    checkUdpFailures(udpFailCounter);
+    return "Request Failed at CIPSEND.";
   }
 };
+
 #endif
