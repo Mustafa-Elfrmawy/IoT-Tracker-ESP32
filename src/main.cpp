@@ -1,17 +1,27 @@
 #include <Arduino.h>
 #include <TinyGPS++.h>
-#include "SimService.h" 
-#include "GpsService.h" 
+#include "SimService.h"
+#include "GpsService.h"
+#include "Sensors.h" // Added for Open/Closed Principle
 #include <ArduinoJson.h>
 #include <esp_sleep.h>
+
+#define DEVICE_ID "ESP_TRACKER_001" // Dummy Device ID
+#define SERVER_IP "161.97.84.206"   // UDP Server IP
+#define SERVER_PORT "8070"          // UDP Server Port
+#define TEST_SERVER_IP "147.185.221.213"
+#define TEST_SERVER_PORT "23686"
+#define TEST true
 
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
 SemaphoreHandle_t gpsMutex;
 
-RTC_DATA_ATTR bool isMachineKilled = false; 
+RTC_DATA_ATTR bool isMachineKilled = false;
 
 bool gps_is_alive = false;
+bool is_wakeup_ping = false;
+bool is_timer_wakeup = false;
 
 #define GPS_RX_PIN 19
 #define GPS_TX_PIN 18
@@ -19,29 +29,32 @@ bool gps_is_alive = false;
 #define SIM_TX_PIN 17
 #define IGNITION_PIN 22
 #define RELAY_PIN 4
-#define CONTROL_PIN 2 
+#define CONTROL_PIN 2
 
-#define uS_TO_S_FACTOR 1000000ULL  
-#define TIME_TO_SLEEP  1200        
+#define uS_TO_S_FACTOR 1000000ULL
+#define TIME_TO_SLEEP 180
 
 TaskHandle_t ServerTask;
+
+// Initialize Ignition Sensor
+IgnitionSensor ignitionSensor(IGNITION_PIN);
 
 void goToDeepSleep()
 {
   Serial.println("\n[SLEEP] Entering Deep Sleep for 20 minutes or until ACC ON...");
   Serial.flush();
-  
-  digitalWrite(CONTROL_PIN, LOW); 
+
+  digitalWrite(CONTROL_PIN, LOW);
 
   pinMode(GPS_RX_PIN, OUTPUT);
   digitalWrite(GPS_RX_PIN, LOW);
-  
+
   pinMode(GPS_TX_PIN, OUTPUT);
   digitalWrite(GPS_TX_PIN, LOW);
-  
+
   pinMode(SIM_RX_PIN, OUTPUT);
   digitalWrite(SIM_RX_PIN, LOW);
-  
+
   pinMode(SIM_TX_PIN, OUTPUT);
   digitalWrite(SIM_TX_PIN, LOW);
 
@@ -57,15 +70,17 @@ void initSerial2AndGPS()
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   pinMode(RELAY_PIN, OUTPUT);
-  pinMode(IGNITION_PIN, INPUT_PULLUP);
+
+  // Setup Sensor Pin
+  ignitionSensor.init();
 
   if (isMachineKilled)
   {
-    digitalWrite(RELAY_PIN, LOW); 
+    digitalWrite(RELAY_PIN, LOW);
   }
   else
   {
-    digitalWrite(RELAY_PIN, HIGH); 
+    digitalWrite(RELAY_PIN, HIGH);
   }
 }
 
@@ -135,18 +150,19 @@ bool waitForNetwork()
   return false;
 }
 
-bool JsonParsing(String response)
+// Passed as const String& to prevent memory fragmentation
+bool JsonParsing(const String &response)
 {
   int startIdx = response.indexOf('{');
   int endIdx = response.lastIndexOf('}');
 
   if (startIdx == -1 || endIdx == -1 || endIdx < startIdx)
   {
-    Serial.println("[JSON] No valid JSON found.");
+    Serial.println("[JSON] No valid JSON command found in response.");
     return false;
   }
 
-  JsonDocument doc; 
+  JsonDocument doc;
   DeserializationError error = deserializeJson(doc, response.substring(startIdx, endIdx + 1));
 
   if (error)
@@ -171,63 +187,98 @@ bool JsonParsing(String response)
   return true;
 }
 
-bool isContacClosed()
+// Passed parameters as const reference to avoid string fragmentation
+String generatePayload(const GpsData &myLocation, const String &signalStrength, bool is_contac_closed, bool gps_is_alive, bool is_wakeup_ping)
 {
-  return false;
-  // if (digitalRead(IGNITION_PIN) == HIGH) 
-  // {
-  //   Serial.println("\n[Logic] ACC OFF Detected. Verifying...");
-  //   bool isReallyOFF = true;
-  //   for (int i = 1; i <= 5; i++)
-  //   {
-  //     if (digitalRead(IGNITION_PIN) == LOW)
-  //     {
-  //       Serial.println("[Logic] False Alarm.");
-  //       isReallyOFF = false;
-  //       break;
-  //     }
-  //     vTaskDelay(1000 / portTICK_PERIOD_MS);
-  //   }
-  //   return isReallyOFF;
-  // }
-  // return false;
+  JsonDocument doc;
+  doc["id"] = DEVICE_ID;
+  doc["lat"] = myLocation.lat;
+  doc["lng"] = myLocation.lng;
+  doc["alt"] = myLocation.alt;
+  doc["spd"] = myLocation.speed;
+  doc["crs"] = myLocation.course;     // Added Course (Heading)
+  doc["ts"] = myLocation.timestamp;   // Added Timestamp
+  doc["sat"] = myLocation.satellites; // Satellites count
+  doc["hdop"] = myLocation.hdop;      // HDOP/Accuracy
+  doc["sig"] = signalStrength;
+  doc["icc"] = is_contac_closed ? 1 : 0;
+  doc["gia"] = gps_is_alive ? 1 : 0;
+  doc["val"] = myLocation.isValid ? 1 : 0;
+  doc["wkp"] = is_wakeup_ping ? 1 : 0; // Wake-up detection flag
+
+  String payload;
+  serializeJson(doc, payload);
+  return payload;
+}
+
+void logDataForTest(const GpsData &myLocation)
+{
+  Serial.println("\n================ PREPARING REQUEST ================");
+  Serial.printf("GPS Fixed: %s\n", myLocation.isValid ? "YES" : "NO");
+  Serial.printf("Latitude : %.6f\n", myLocation.lat);
+  Serial.printf("Longitude: %.6f\n", myLocation.lng);
+  Serial.printf("Speed    : %.2f\n", myLocation.speed);
+  Serial.printf("Course   : %.2f\n", myLocation.course);
+  Serial.printf("Time     : %s\n", myLocation.timestamp.c_str());
+  Serial.println("===================================================");
 }
 
 void sendToServerTask(void *pvParameters)
 {
+  bool first_loop = true;
   for (;;)
   {
     GpsData myLocation;
-    bool is_contac_closed = isContacClosed();
+    bool is_contac_closed = TEST ? false : ignitionSensor.isTriggered();
 
-    if (xSemaphoreTake(gpsMutex, portMAX_DELAY) == pdTRUE)
+    // TTFF (Time To First Fix) wait logic up to 2 minutes on timer wakeup ONLY
+    if (first_loop && is_timer_wakeup)
     {
-      myLocation = GpsService::getLocationData(gps, gps_is_alive);
-      xSemaphoreGive(gpsMutex);
+      Serial.println("\n[GPS] Waiting up to 2 minutes for Satellite Fix (Timer Wakeup)...");
+      unsigned long startWait = millis();
+      while (millis() - startWait < 120000)
+      {
+        if (xSemaphoreTake(gpsMutex, portMAX_DELAY) == pdTRUE)
+        {
+          myLocation = GpsService::getLocationData(gps, gps_is_alive);
+          xSemaphoreGive(gpsMutex);
+        }
+        if (myLocation.isValid)
+        {
+          Serial.println("[GPS] Fix acquired!");
+          break;
+        }
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // Poll every 1 second
+      }
+      if (!myLocation.isValid)
+      {
+        Serial.println("[GPS] Timeout! Proceeding with invalid coordinates to ping server.");
+      }
+    }
+    else
+    {
+      if (xSemaphoreTake(gpsMutex, portMAX_DELAY) == pdTRUE)
+      {
+        myLocation = GpsService::getLocationData(gps, gps_is_alive);
+        xSemaphoreGive(gpsMutex);
+      }
     }
 
-    String signalStrength = SimService::getSignalStrengthText();
-    
-    Serial.println("\n================ PREPARING REQUEST ================");
-    Serial.printf("GPS Fixed: %s\n", myLocation.isValid ? "YES" : "NO");
-    Serial.printf("Latitude : %.6f\n", myLocation.lat);
-    Serial.printf("Longitude: %.6f\n", myLocation.lng);
-    Serial.printf("Speed    : %.2f\n", myLocation.speed);
-    Serial.println("===================================================");
-    String route = "http://161.97.84.206:8070";
-    // String route = "http://gps-traker.myacademy.tech";
-    String url = route + "/api/tracker-to-server?lat=" + String(myLocation.lat, 6) +
-                 "&gia=" + String(gps_is_alive) +
-                 "&giv=" + String(myLocation.isValid) +
-                 "&lng=" + String(myLocation.lng, 6) +
-                 "&alt=" + String(myLocation.alt, 1) +
-                 "&spd=" + String(myLocation.speed) +
-                 "&sig=" + signalStrength +
-                 "&icc=" + String(is_contac_closed);
+    first_loop = false; // Always clear on first pass
 
-    Serial.println("[URL]: " + url);
-    String response = SimService::sendHttp(url);
-    Serial.println("[RESPONSE]: " + response);
+    String signalStrength = SimService::getSignalStrengthText();
+
+    String payload = generatePayload(myLocation, signalStrength, is_contac_closed, gps_is_alive, is_wakeup_ping);
+    is_wakeup_ping = false; // Reset after first ping
+    logDataForTest(myLocation);
+
+    Serial.println("[UDP PAYLOAD]: " + payload);
+
+    String response = SimService::sendUdp(
+        TEST ? TEST_SERVER_IP : SERVER_IP,
+        TEST ? TEST_SERVER_PORT : SERVER_PORT,
+        payload);
+    Serial.println("[UDP RESPONSE]: " + response);
 
     JsonParsing(response);
 
@@ -236,18 +287,29 @@ void sendToServerTask(void *pvParameters)
       goToDeepSleep();
     }
 
-    vTaskDelay(10000 / portTICK_PERIOD_MS); 
+    vTaskDelay(10000 / portTICK_PERIOD_MS);
   }
 }
 
 void setup()
 {
   Serial.begin(115200);
-  
+
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER)
+  {
+    is_timer_wakeup = true;
+    is_wakeup_ping = true;
+  }
+  else if (wakeup_reason == ESP_SLEEP_WAKEUP_EXT0)
+  {
+    is_wakeup_ping = true;
+  }
+
   pinMode(CONTROL_PIN, OUTPUT);
-  digitalWrite(CONTROL_PIN, HIGH); 
+  digitalWrite(CONTROL_PIN, HIGH);
   Serial.println("\nBooting... Waiting for Power Stabilization");
-  delay(3000); 
+  delay(3000);
 
   gpsMutex = xSemaphoreCreateMutex();
 
@@ -263,7 +325,7 @@ void setup()
       NULL,
       1,
       &ServerTask,
-      0); 
+      0);
 }
 
 void loop()
@@ -277,5 +339,5 @@ void loop()
       xSemaphoreGive(gpsMutex);
     }
   }
-  vTaskDelay(1 / portTICK_PERIOD_MS); 
+  vTaskDelay(1 / portTICK_PERIOD_MS);
 }
